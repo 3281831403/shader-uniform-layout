@@ -57,9 +57,135 @@ The module uses only the Python standard library and never reads the network,
 the clock or random state.
 """
 
+import struct
+from collections.abc import Mapping, Sequence
+
 
 class LayoutError(Exception):
     """Raised for an invalid uniform layout, type, count, offset or rule."""
+
+
+_BASE_SIZES = {
+    "float": 4,
+    "int": 4,
+    "vec2": 8,
+    "vec3": 12,
+    "vec4": 16,
+    "mat3": 48,
+    "mat4": 64,
+}
+
+_BASE_ALIGNMENTS = {
+    "float": 4,
+    "int": 4,
+    "vec2": 8,
+    "vec3": 16,
+    "vec4": 16,
+    "mat3": 16,
+    "mat4": 16,
+}
+
+_RULES = ("std140", "std430")
+
+_VECTOR_COMPONENTS = {"vec2": 2, "vec3": 3, "vec4": 4}
+_MATRIX_COLUMNS = {"mat3": 3, "mat4": 4}
+
+
+def _validate_rule(rule):
+    if rule not in _RULES:
+        raise LayoutError(f"unknown layout rule: {rule!r}")
+
+
+def _round_up(value, alignment):
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _is_positive_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _field_info(field, rule):
+    """Validate one field and return its placement facts.
+
+    Returns a dict with ``name``, ``count``, ``align`` (base alignment of the
+    field as a whole), ``size`` (bytes consumed, including array tail
+    padding), ``elem_stride`` (per-element stride for arrays, else ``None``)
+    and ``nested`` (the nested field list for inline structures, else
+    ``None``).
+    """
+    if not isinstance(field, Mapping):
+        raise LayoutError(f"field must be a mapping, got {type(field).__name__}")
+
+    name = field.get("name")
+    if not isinstance(name, str) or not name:
+        raise LayoutError(f"field name must be a non-empty string, got {name!r}")
+
+    count = field.get("count", 1)
+    if not _is_positive_int(count):
+        raise LayoutError(f"field {name!r}: count must be a positive integer, got {count!r}")
+
+    ftype = field.get("type")
+    info = {"name": name, "count": count, "nested": None, "elem_stride": None}
+
+    if isinstance(ftype, str):
+        if ftype not in _BASE_SIZES:
+            raise LayoutError(f"field {name!r}: unknown type {ftype!r}")
+        if count == 1:
+            info["align"] = _BASE_ALIGNMENTS[ftype]
+            info["size"] = _BASE_SIZES[ftype]
+        else:
+            info["align"] = 16
+            info["elem_stride"] = _round_up(_BASE_SIZES[ftype], 16)
+            info["size"] = info["elem_stride"] * count
+        info["base_type"] = ftype
+    elif isinstance(ftype, Sequence) and not isinstance(ftype, (str, bytes, bytearray)):
+        if not ftype:
+            raise LayoutError(f"field {name!r}: nested structure needs at least one field")
+        _, _, sub_stride, sub_align = _layout(list(ftype), rule)
+        info["nested"] = list(ftype)
+        if count == 1:
+            info["align"] = sub_align
+            info["size"] = sub_stride
+        else:
+            info["align"] = 16
+            info["elem_stride"] = _round_up(sub_stride, 16)
+            info["size"] = info["elem_stride"] * count
+        info["base_type"] = None
+    else:
+        raise LayoutError(f"field {name!r}: unknown type {ftype!r}")
+
+    return info
+
+
+def _layout(fields, rule):
+    """Core layout engine: returns (offsets, size, stride, struct_alignment)."""
+    _validate_rule(rule)
+    if not isinstance(fields, (list, tuple)):
+        raise LayoutError(f"fields must be a list, got {type(fields).__name__}")
+
+    offsets = {}
+    member_alignments = []
+    cursor = 0
+    for field in fields:
+        info = _field_info(field, rule)
+        name = info["name"]
+        if name in offsets:
+            raise LayoutError(f"duplicate field name: {name!r}")
+        offset = _round_up(cursor, info["align"])
+        offsets[name] = offset
+        cursor = offset + info["size"]
+        member_alignments.append(info["align"])
+
+    size = cursor
+    if not member_alignments:
+        return offsets, 0, 0, 0
+
+    if rule == "std140":
+        struct_alignment = 16
+    else:  # std430: align to the largest member alignment
+        struct_alignment = max(member_alignments)
+    stride = _round_up(size, struct_alignment)
+    return offsets, size, stride, struct_alignment
 
 
 def type_size(type_name: str) -> int:
@@ -79,7 +205,9 @@ def type_size(type_name: str) -> int:
     Raises:
         LayoutError: if *type_name* is not one of the seven base types.
     """
-    raise NotImplementedError
+    if not isinstance(type_name, str) or type_name not in _BASE_SIZES:
+        raise LayoutError(f"unknown base type: {type_name!r}")
+    return _BASE_SIZES[type_name]
 
 
 def base_alignment(type_name: str, rule: str) -> int:
@@ -102,7 +230,10 @@ def base_alignment(type_name: str, rule: str) -> int:
     Raises:
         LayoutError: for an unknown type or an unknown rule.
     """
-    raise NotImplementedError
+    _validate_rule(rule)
+    if not isinstance(type_name, str) or type_name not in _BASE_ALIGNMENTS:
+        raise LayoutError(f"unknown base type: {type_name!r}")
+    return _BASE_ALIGNMENTS[type_name]
 
 
 def layout_struct(fields: list[dict], rule: str) -> dict:
@@ -141,7 +272,8 @@ def layout_struct(fields: list[dict], rule: str) -> dict:
         LayoutError: for a malformed field list, duplicate name, unknown type
             or unknown rule.
     """
-    raise NotImplementedError
+    offsets, size, stride, _ = _layout(fields, rule)
+    return {"offsets": offsets, "size": size, "stride": stride}
 
 
 def array_stride(type_name: str, count: int, rule: str) -> int:
@@ -160,7 +292,11 @@ def array_stride(type_name: str, count: int, rule: str) -> int:
     Raises:
         LayoutError: for an unknown type/rule or a non-positive count.
     """
-    raise NotImplementedError
+    _validate_rule(rule)
+    size = type_size(type_name)
+    if not _is_positive_int(count):
+        raise LayoutError(f"array count must be a positive integer, got {count!r}")
+    return _round_up(size, 16)
 
 
 def pad_bytes(fields: list[dict], rule: str) -> list[int]:
@@ -181,7 +317,23 @@ def pad_bytes(fields: list[dict], rule: str) -> list[int]:
     Raises:
         LayoutError: for malformed fields or an unknown rule.
     """
-    raise NotImplementedError
+    _validate_rule(rule)
+    if not isinstance(fields, (list, tuple)):
+        raise LayoutError(f"fields must be a list, got {type(fields).__name__}")
+
+    pads = []
+    seen = set()
+    cursor = 0
+    for field in fields:
+        info = _field_info(field, rule)
+        name = info["name"]
+        if name in seen:
+            raise LayoutError(f"duplicate field name: {name!r}")
+        seen.add(name)
+        offset = _round_up(cursor, info["align"])
+        pads.append(offset - cursor)
+        cursor = offset + info["size"]
+    return pads
 
 
 def validate_layout(fields: list[dict], rule: str) -> list[str]:
@@ -206,7 +358,196 @@ def validate_layout(fields: list[dict], rule: str) -> list[str]:
     reported as problem strings rather than raised.  An unknown rule is a
     programming error and raises :class:`LayoutError`.
     """
-    raise NotImplementedError
+    _validate_rule(rule)
+    if not isinstance(fields, (list, tuple)):
+        return [f"fields must be a list, got {type(fields).__name__}"]
+
+    infos = []
+    structural_problems = []
+    seen = set()
+    for field in fields:
+        try:
+            info = _field_info(field, rule)
+            if info["name"] in seen:
+                raise LayoutError(f"duplicate field name: {info['name']!r}")
+            seen.add(info["name"])
+            infos.append(info)
+        except LayoutError as exc:
+            structural_problems.append(str(exc))
+            infos.append(None)
+
+    if structural_problems:
+        return structural_problems
+
+    offsets, _, stride, _ = _layout(list(fields), rule)
+
+    problems = []
+    placed = []  # (start, end, name) intervals from diagnostic offsets
+    for field, info in zip(fields, infos):
+        name = info["name"]
+
+        if "offset" in field:
+            proposed = field["offset"]
+            if not isinstance(proposed, int) or isinstance(proposed, bool) or proposed < 0:
+                problems.append(
+                    f"field {name}: offset {proposed!r} is not a non-negative integer"
+                )
+            else:
+                if proposed % info["align"] != 0:
+                    problems.append(
+                        f"field {name}: offset {proposed} is not aligned to "
+                        f"{info['align']} bytes"
+                    )
+                canonical = offsets[name]
+                if proposed != canonical:
+                    problems.append(
+                        f"field {name}: offset {proposed} does not match the "
+                        f"canonical offset {canonical}"
+                    )
+                end = proposed + info["size"]
+                if end > stride:
+                    problems.append(
+                        f"field {name}: storage [{proposed}, {end}) is out of bounds; "
+                        f"exceeds structure stride {stride}"
+                    )
+                for start, prev_end, prev_name in placed:
+                    if proposed < prev_end and start < end:
+                        problems.append(
+                            f"field {name}: offset {proposed} overlaps field "
+                            f"{prev_name} at [{start}, {prev_end})"
+                        )
+                placed.append((proposed, end, name))
+
+        if "stride" in field and info["count"] > 1:
+            proposed_stride = field["stride"]
+            expected = info["elem_stride"]
+            if (
+                not isinstance(proposed_stride, int)
+                or isinstance(proposed_stride, bool)
+                or proposed_stride <= 0
+            ):
+                problems.append(
+                    f"field {name}: array stride {proposed_stride!r} is not a "
+                    f"positive integer"
+                )
+            else:
+                if proposed_stride % 16 != 0:
+                    problems.append(
+                        f"field {name}: array stride {proposed_stride} is not a "
+                        f"multiple of 16"
+                    )
+                if proposed_stride != expected:
+                    problems.append(
+                        f"field {name}: array stride {proposed_stride} does not "
+                        f"match the canonical stride {expected}"
+                    )
+
+    return problems
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _as_sequence(value, length, what):
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        raise LayoutError(f"{what} must be a sequence of {length} numbers")
+    if len(value) != length:
+        raise LayoutError(
+            f"{what} must have exactly {length} elements, got {len(value)}"
+        )
+    return list(value)
+
+
+def _pack_base(buf, offset, base_type, value, what):
+    try:
+        if base_type == "float":
+            if not _is_number(value):
+                raise LayoutError(f"{what} must be a number, got {value!r}")
+            struct.pack_into("<f", buf, offset, float(value))
+        elif base_type == "int":
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise LayoutError(f"{what} must be an integer, got {value!r}")
+            struct.pack_into("<i", buf, offset, value)
+        elif base_type in _VECTOR_COMPONENTS:
+            components = _as_sequence(
+                value, _VECTOR_COMPONENTS[base_type], what
+            )
+            for component in components:
+                if not _is_number(component):
+                    raise LayoutError(
+                        f"{what} components must be numbers, got {component!r}"
+                    )
+            struct.pack_into(
+                f"<{len(components)}f", buf, offset,
+                *(float(c) for c in components),
+            )
+        elif base_type in _MATRIX_COLUMNS:
+            columns = _MATRIX_COLUMNS[base_type]
+            flat = _as_sequence(value, columns * columns, what)
+            for component in flat:
+                if not _is_number(component):
+                    raise LayoutError(
+                        f"{what} components must be numbers, got {component!r}"
+                    )
+            # Column-major: each column occupies one 16-byte slot.
+            for column in range(columns):
+                start = column * columns
+                struct.pack_into(
+                    f"<{columns}f",
+                    buf,
+                    offset + 16 * column,
+                    *(float(c) for c in flat[start:start + columns]),
+                )
+        else:  # pragma: no cover - guarded by field validation
+            raise LayoutError(f"unknown base type: {base_type!r}")
+    except struct.error as exc:
+        raise LayoutError(f"{what}: cannot pack {value!r}: {exc}") from exc
+
+
+def _pack_field(buf, offset, field, value, rule):
+    name = field["name"]
+    ftype = field["type"]
+    count = field.get("count", 1)
+    what = f"field {name}"
+
+    if isinstance(ftype, str):
+        if count == 1:
+            _pack_base(buf, offset, ftype, value, what)
+        else:
+            elements = _as_sequence(value, count, what)
+            elem_stride = _round_up(_BASE_SIZES[ftype], 16)
+            for index, element in enumerate(elements):
+                _pack_base(
+                    buf, offset + index * elem_stride, ftype, element,
+                    f"{what}[{index}]",
+                )
+    else:
+        nested = list(ftype)
+        _, _, sub_stride, _ = _layout(nested, rule)
+        if count == 1:
+            if not isinstance(value, Mapping):
+                raise LayoutError(f"{what} must be a mapping of nested values")
+            _pack_struct(buf, offset, nested, value, rule, what)
+        else:
+            elements = _as_sequence(value, count, what)
+            elem_stride = _round_up(sub_stride, 16)
+            for index, element in enumerate(elements):
+                if not isinstance(element, Mapping):
+                    raise LayoutError(f"{what}[{index}] must be a mapping")
+                _pack_struct(
+                    buf, offset + index * elem_stride, nested, element,
+                    rule, f"{what}[{index}]",
+                )
+
+
+def _pack_struct(buf, base, fields, values, rule, what):
+    offsets, _, _, _ = _layout(fields, rule)
+    for field in fields:
+        name = field["name"]
+        if name not in values:
+            raise LayoutError(f"{what}: missing value for field {name}")
+        _pack_field(buf, base + offsets[name], field, values[name], rule)
 
 
 def pack_values(fields: list[dict], values: dict, rule: str) -> bytes:
@@ -232,7 +573,18 @@ def pack_values(fields: list[dict], values: dict, rule: str) -> bytes:
     Raises:
         LayoutError: for malformed fields/values or an unknown rule.
     """
-    raise NotImplementedError
+    _validate_rule(rule)
+    if not isinstance(values, Mapping):
+        raise LayoutError(f"values must be a mapping, got {type(values).__name__}")
+
+    offsets, _, stride, _ = _layout(fields, rule)
+    buf = bytearray(stride)
+    for field in fields:
+        name = field["name"]
+        if name not in values:
+            raise LayoutError(f"missing value for field {name}")
+        _pack_field(buf, offsets[name], field, values[name], rule)
+    return bytes(buf)
 
 
 def layout_batch(blocks: list[dict], rule: str) -> dict:
@@ -260,4 +612,24 @@ def layout_batch(blocks: list[dict], rule: str) -> dict:
         LayoutError: if any block is invalid, a name is duplicated, or
             ``rule`` is unknown.
     """
-    raise NotImplementedError
+    _validate_rule(rule)
+    if not isinstance(blocks, (list, tuple)):
+        raise LayoutError(f"blocks must be a list, got {type(blocks).__name__}")
+
+    order = []
+    layouts = {}
+    for block in blocks:
+        if not isinstance(block, Mapping):
+            raise LayoutError(f"block must be a mapping, got {type(block).__name__}")
+        name = block.get("name")
+        if not isinstance(name, str) or not name:
+            raise LayoutError(f"block name must be a non-empty string, got {name!r}")
+        if name in layouts:
+            raise LayoutError(f"duplicate block name: {name!r}")
+        if "fields" not in block:
+            raise LayoutError(f"block {name!r} is missing its 'fields' list")
+        # Each block is laid out from a clean cursor: no shared offset state.
+        layouts[name] = layout_struct(block["fields"], rule)
+        order.append(name)
+
+    return {"order": order, "layouts": layouts}
